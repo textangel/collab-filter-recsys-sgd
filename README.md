@@ -16,3 +16,9 @@ In addition to this, we have a regularization term, penalizing the absolute valu
 This is a standard square regularization term over all parameter values, which means that the parameters are adjusted linearly in the gradient updates.
 
 We initialize the biases to each's user's (or item's) average rating minus `mu`. We initialize the embedding matrices uniformly from 0 to `a`, picking `a` such that the dot product of any corresponding rows in `M_u` and `M_i` will equal to `mu`.
+
+The code is fast since it is numpy vectorized.
+
+Usage:
+  - The CollabFilter class uses as input one pandas dataframe with three columns: ['user_id', 'item_id', 'score'].
+  - Calling `train_item_item_cf()` will train the model for a specified number of epochs.
