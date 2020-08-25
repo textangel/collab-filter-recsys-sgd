@@ -16,7 +16,8 @@ import pickle
 # Recommendation with Categorical Features (FFM)
 
 class CollabFilter(object):
-    def __init__(self, user_item, user_attributes=None, item_attributes=None, latent_size=20, reg=0.2, counts=False, lr = 0.01):
+    def __init__(self, user_item, user_attributes=None, item_attributes=None, latent_size=20, reg=0.2, counts=False, lr = 0.01,
+                 neg_sample_ratio=1.0):
         """
         `user_item` is a pandas dataframe of user-product purchase counts with at least three columns:
         1. `user_id`
@@ -38,18 +39,19 @@ class CollabFilter(object):
         self.matrix = user_item
         self.matrix['item'] = self.matrix['item'].map(lambda x: self.item2id[x])
         self.matrix['user'] = self.matrix['user'].map(lambda x: self.user2id[x])
-        
+        self.neg_sample_ratio = neg_sample_ratio
+
         
         # Overall Average
-        self.mu = np.mean(self.matrix['score'])
+        self.mu = np.mean(self.matrix['score']) / (self.neg_sample_ratio + 1)
 
         # User Bias
         self.matrix.sort_values('user')
-        self.ub = np.array(self.matrix.groupby('user').agg({'score':'mean'})['score']) - self.mu
+        self.ub = np.array(self.matrix.groupby('user').agg({'score':'mean'})['score']) / (self.neg_sample_ratio + 1) - self.mu
         
         # Item Bias
         self.matrix.sort_values('item')
-        self.ib = np.array(self.matrix.groupby('item').agg({'score':'mean'})['score']) - self.mu
+        self.ib = np.array(self.matrix.groupby('item').agg({'score':'mean'})['score']) / (self.neg_sample_ratio + 1) - self.mu
 
         # each of the dimensions have to have square values on average `self.mu/self.latent_size`.
         # Taking the integral 1/3 a^3, dividing by 2 and then solving, we obtain the below formula for the range of our random init values.
@@ -70,13 +72,28 @@ class CollabFilter(object):
             self.item_attributes = item_attributes
 
     def train_item_item_cf(self, batch_sz=512, num_epochs=30):
+        train_tmp = self.train
+        if self.neg_sample_ratio > 0:
+            neg_sample = self.get_negative_sample(self.train)
+            train_tmp = self.train.append(neg_sample)
+
         for epoch in range(num_epochs):
-            loss = self.train_epoch(batch_sz, epoch)
+            train = np.array(train_tmp.sample(frac=1)[['user', 'item', 'score']])
+            loss, early_stopped = self.train_epoch(train, batch_sz, epoch)
+            if early_stopped:
+                print("Early Stopped!")
+                break
 
     # Train using Stochastic Gradient Descent
-    def train_epoch(self, batch_sz=128, epoch=0):
-        # Random shuffle the matrix
-        train = np.array(self.train.sample(frac=1)[['user', 'item', 'score']])
+    def get_negative_sample(self, base):
+        sample_ratio = self.neg_sample_ratio
+        neg_sample_train = pd.DataFrame(np.random.choice(list(self.id2user.keys()), int(sample_ratio * len(base))), columns=["user"])
+        neg_sample_train['item'] = pd.Series(np.random.choice(list(self.id2item.keys()), int(sample_ratio * len(base))))
+        neg_sample_train['score'] = 0
+        neg_sample_train = neg_sample_train[['user', 'item', 'score']]
+        return neg_sample_train
+
+    def train_epoch(self, train, batch_sz=128, epoch=0):
         num_rows = train.shape[0]
         count = 0
         loss = 0
@@ -125,17 +142,22 @@ class CollabFilter(object):
                 print(f"Ep {epoch}: {count * batch_sz} out of {num_rows} processed. Loss = {loss / 100}")
                 if loss >= np.mean(last_40_loss):
                     print("Early Stop!")
+                    return loss, True
                 if len(last_40_loss) >= 40:
                     last_40_loss = last_40_loss[1:]
                 last_40_loss.append(loss)
-        return loss
+        return loss, False
 
     def compute_dev_loss(self):
-        dev = np.array(self.dev)
+        dev_temp = self.dev
+        if self.neg_sample_ratio > 0:
+            neg_sample_dev = self.get_negative_sample(self.dev)
+            dev_temp = self.dev.append(neg_sample_dev)
+        dev = np.array(dev_temp)
         u_bias = self.ub[dev[:,0]]
         i_bias = self.ib[dev[:,1]]
         cross_term = np.sum(self.ue[dev[:,0]] * self.ie[dev[:,1]], axis=1)
-        loss =  np.sum( (self.dev['score'] - (self.mu + u_bias + i_bias + cross_term)) ** 2) + \
+        loss =  np.sum( (dev_temp['score'] - (self.mu + u_bias + i_bias + cross_term)) ** 2) + \
             self.reg * (np.sum((self.ue) ** 2) + np.sum((self.ie) ** 2) + np.sum((self.ub) ** 2) + np.sum((self.ib) ** 2))
         return loss
 
@@ -150,64 +172,62 @@ class CollabFilter(object):
         f.close()
         self.__dict__.update(from_file)
 
-    def get_recommendations_user(self, user_id, repeat_old=False, verbose=False, n=10):
+    def get_recommendations_user(self, user_id, repeat_old=False, verbose=False, n=20):
         u = self.user2id[user_id]
-        old_items_ids = list(self.matrix[self.matrix['user'] == u]['item'])
-        old_items = [self.id2item[a] for a in old_items_ids]
+        old_items_ = self.matrix[self.matrix['user'] == u]
+        old_items_['id'] = old_items_['item'].map(lambda x: self.id2item[x])
 
         scores = np.sum(self.ue[u] * self.ie, axis=1) + self.ub[u] + self.ib + self.mu
         topn_ids = np.argpartition(-scores, n)[:n]
         topn = [self.id2item[a] for a in topn_ids]
         topn_scores = -np.partition(-scores, n)[:n]
-
-        if self.item_attributes is not None:
-            prev_purchases = self.item_attributes[self.item_attributes['id'].isin(old_items)]
-        topn_ids = np.argpartition(-scores, n)[:n]
-        topn = [self.id2item[a] for a in topn_ids]
-        topn_scores = -np.partition(-scores, n)[:n]
-
-        if self.item_attributes is not None:
-            prev_purchases = self.item_attributes[self.item_attributes['id'].isin(old_items)]
-            recommendations = self.item_attributes[self.item_attributes['id'].isin(topn)]
+        recommendations = pd.DataFrame(topn_ids, columns=['index'])
+        recommendations['id'] = topn
+        recommendations['score'] = topn_scores
 
         if verbose:
             print(f"User {u} has previously consumed: ")
             if self.item_attributes is not None:
-                for ix, row in prev_purchases.iterrows():
-                    print(f" - {row['name']}")
+                old_items_ = old_items_.merge(self.item_attributes, on='id')
+                for ix, row in old_items_.iterrows():
+                    print(f" - {row['name']} {float(row['score']):.2f}")
             else:
                 print(f" - Items: {old_items}")
             print(f"We recommend for user {u}: ")
+
             if self.item_attributes is not None:
+                recommendations = recommendations.merge(self.item_attributes, on='id')
                 for ix, row in recommendations.iterrows():
-                    print(f" - {row['name']}")
+                    print(f" - {row['name']} {float(row['score']):.2f}")
             else:
                 print(f" - Items: {topn}")
 
 if __name__ == '__main__':
-    user_book_raw= pd.read_csv('book-crossing/BX-Book-Ratings.csv',engine='python', sep=";", error_bad_lines=False )
-    user_book_raw = user_book_raw[user_book_raw["Book-Rating"]>0]
-    user_book_raw = user_book_raw.set_axis(["user", "item", "score"], axis=1, inplace=False)
+    # user_book_raw= pd.read_csv('book-crossing/BX-Book-Ratings.csv',engine='python', sep=";", error_bad_lines=False )
+    # user_book_raw = user_book_raw[user_book_raw["Book-Rating"]>0]
+    # user_book_raw = user_book_raw.set_axis(["user", "item", "score"], axis=1, inplace=False)
+    #
+    #
+    # item_attributes = pd.read_csv('book-crossing/BX-Books.csv',engine='python', sep=";", error_bad_lines=False )
+    # item_attributes = item_attributes[["ISBN", "Book-Title", "Book-Author"]]
+    # item_attributes['name'] = item_attributes["Book-Title"] + " (" + item_attributes["Book-Author"] + ")"
+    # item_attributes['id'] = item_attributes['ISBN']
+    # item_attributes = item_attributes[['id', 'name']]
+    # item_attributes = item_attributes.set_axis(['id', 'name'], axis=1, inplace=False)
+    #
+    # user_attributes = pd.read_csv('book-crossing/BX-Users.csv', engine='python', sep=";", error_bad_lines=False)
+    # user_attributes['name'] = "Loc: " + user_attributes["Location"] + "; Age:" + user_attributes["Age"].astype(str)
+    # user_attributes['id'] = user_attributes['User-ID']
+    # user_attributes = user_attributes[['id', 'name']]
+    # user_attributes = user_attributes.set_axis(['id', 'name'], axis=1, inplace=False)
+    # cf = CollabFilter(user_book_raw, user_attributes=user_attributes, item_attributes=item_attributes,
+    #                   latent_size=40, neg_sample_ratio=10.0)
+    #
+    # # cf = CollabFilter(user_book_raw)
+    # cf.train_item_item_cf(batch_sz=512, num_epochs=15)
+    # cf.save_model("models/collab_filter_model_3.model")
+    # del cf
 
-
-    item_attributes = pd.read_csv('book-crossing/BX-Books.csv',engine='python', sep=";", error_bad_lines=False )
-    item_attributes = item_attributes[["ISBN", "Book-Title", "Book-Author"]]
-    item_attributes['name'] = item_attributes["Book-Title"] + " (" + item_attributes["Book-Author"] + ")"
-    item_attributes['id'] = item_attributes['ISBN']
-    item_attributes = item_attributes[['id', 'name']]
-    item_attributes = item_attributes.set_axis(['id', 'name'], axis=1, inplace=False)
-
-    user_attributes = pd.read_csv('book-crossing/BX-Users.csv', engine='python', sep=";", error_bad_lines=False)
-    user_attributes['name'] = "Loc: " + user_attributes["Location"] + "; Age:" + user_attributes["Age"].astype(str)
-    user_attributes['id'] = user_attributes['User-ID']
-    user_attributes = user_attributes[['id', 'name']]
-    user_attributes = user_attributes.set_axis(['id', 'name'], axis=1, inplace=False)
-
-    cf = CollabFilter(user_book_raw, user_attributes=user_attributes, item_attributes=item_attributes)
-    cf.train_item_item_cf(batch_sz=512, num_epochs=15)
-    cf.save_model("models/collab_filter_model_2.model")
-
-    del cf
     cf = CollabFilter(None)
-    cf.load_model("models/collab_filter_model_2.model")
-    cf.get_recommendations_user(56271, verbose=True)
+    cf.load_model("models/collab_filter_model_3.model")
+    cf.get_recommendations_user(107784, verbose=True)
